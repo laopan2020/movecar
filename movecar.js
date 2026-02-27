@@ -1,7 +1,7 @@
 /**
  * MoveCar 多用户智能挪车系统 - 并发隔离优化版
  * 隔离逻辑：每一个 KV 键值对都强制带上用户后缀，确保互不干扰
- * 新增：Webhook 通知 + 企业微信应用消息
+ * 新增：Webhook 通知 + 企业微信应用消息（支持卡片/文本）
  */
 
 addEventListener('fetch', event => {
@@ -103,8 +103,8 @@ async function sendWebhook(webhookUrl, title, content, confirmUrl) {
   });
 }
 
-/** 发送企业微信应用消息（文本卡片） */
-async function sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl) {
+/** 发送企业微信应用消息（支持卡片或文本） */
+async function sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl, msgType = 'card') {
   // 尝试从 KV 获取缓存的 access_token
   const tokenKey = `wecom_token_${userKey}`;
   let accessToken = await MOVE_CAR_STATUS.get(tokenKey);
@@ -122,18 +122,31 @@ async function sendWecomApp(userKey, corpid, agentid, secret, touser, title, con
     await MOVE_CAR_STATUS.put(tokenKey, accessToken, { expirationTtl: 7000 });
   }
 
-  // 构建文本卡片消息
-  const message = {
-    touser: touser || '@all',
-    msgtype: 'textcard',
-    agentid: parseInt(agentid),
-    textcard: {
-      title: title,
-      description: content.replace(/\\n/g, '\n'), // 将文字换行符转换为真实换行
-      url: confirmUrl,
-      btntxt: '前往确认'
-    }
-  };
+  let message;
+  if (msgType === 'text') {
+    // 文本消息（内容中包含链接）
+    message = {
+      touser: touser || '@all',
+      msgtype: 'text',
+      agentid: parseInt(agentid),
+      text: {
+        content: `${title}\n\n${content}\n\n🔗 点击确认前往：${confirmUrl}`
+      }
+    };
+  } else {
+    // 默认卡片消息
+    message = {
+      touser: touser || '@all',
+      msgtype: 'textcard',
+      agentid: parseInt(agentid),
+      textcard: {
+        title: title,
+        description: content.replace(/\\n/g, '\n'), // 将文字换行符转换为真实换行
+        url: confirmUrl,
+        btntxt: '前往确认'
+      }
+    };
+  }
 
   const sendUrl = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`;
   const sendResp = await fetch(sendUrl, {
@@ -146,7 +159,7 @@ async function sendWecomApp(userKey, corpid, agentid, secret, touser, title, con
     // 如果 token 过期，尝试刷新一次
     if (sendData.errcode === 42001 || sendData.errcode === 40014) {
       await MOVE_CAR_STATUS.delete(tokenKey);
-      return sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl); // 重试
+      return sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl, msgType); // 重试
     }
     throw new Error(`企业微信发送失败: ${sendData.errmsg}`);
   }
@@ -176,6 +189,7 @@ async function handleNotify(request, url, userKey) {
     const wecomAgentid = getUserConfig(userKey, 'WECOM_AGENTID');
     const wecomSecret = getUserConfig(userKey, 'WECOM_SECRET');
     const wecomTouser = getUserConfig(userKey, 'WECOM_TOUSER') || '@all';
+    const wecomMsgType = getUserConfig(userKey, 'WECOM_MSGTYPE') || 'card';  // 新增：消息类型，默认卡片
     const carTitle = getUserConfig(userKey, 'CAR_TITLE') || '车主';
 
     const baseDomain = (typeof EXTERNAL_URL !== 'undefined' && EXTERNAL_URL) ? EXTERNAL_URL.replace(/\/$/, "") : url.origin;
@@ -221,9 +235,9 @@ async function handleNotify(request, url, userKey) {
       tasks.push(sendWebhook(webhookUrl, "挪车请求：" + carTitle, notifyText, confirmUrl));
     }
 
-    // 企业微信应用消息
+    // 企业微信应用消息（支持卡片/文本）
     if (wecomCorpid && wecomAgentid && wecomSecret) {
-      tasks.push(sendWecomApp(userKey, wecomCorpid, wecomAgentid, wecomSecret, wecomTouser, "挪车请求：" + carTitle, notifyText, confirmUrl));
+      tasks.push(sendWecomApp(userKey, wecomCorpid, wecomAgentid, wecomSecret, wecomTouser, "挪车请求：" + carTitle, notifyText, confirmUrl, wecomMsgType));
     }
 
     await Promise.all(tasks);
