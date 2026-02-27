@@ -88,7 +88,88 @@ function generateMapUrls(lat, lng) {
   };
 }
 
-// --- 核心修改：支持 PushPlus 和 Bark ---
+// ========== 新增通知渠道 ==========
+
+/** 发送通用 Webhook */
+async function sendWebhook(webhookUrl, title, content, confirmUrl) {
+  const payload = {
+    title: title,
+    content: content,
+    url: confirmUrl,
+    timestamp: Date.now()
+  };
+  return fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+/** 发送企业微信应用消息（支持卡片/文本） */
+async function sendWecomApp(corpid, agentid, secret, touser, title, content, confirmUrl, msgType = 'card') {
+  // 尝试从 KV 获取缓存的 access_token
+  const tokenKey = 'wecom_access_token';
+  let accessToken = await MOVE_CAR_STATUS.get(tokenKey);
+  
+  if (!accessToken) {
+    // 获取新 token
+    const tokenUrl = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpid}&corpsecret=${secret}`;
+    const tokenResp = await fetch(tokenUrl);
+    const tokenData = await tokenResp.json();
+    if (tokenData.errcode !== 0) {
+      throw new Error(`企业微信获取 token 失败: ${tokenData.errmsg}`);
+    }
+    accessToken = tokenData.access_token;
+    // 缓存 token，设置 7000 秒过期（官方 7200 秒）
+    await MOVE_CAR_STATUS.put(tokenKey, accessToken, { expirationTtl: 7000 });
+  }
+
+  let message;
+  if (msgType === 'text') {
+    // 文本消息（内容中包含链接）
+    message = {
+      touser: touser || '@all',
+      msgtype: 'text',
+      agentid: parseInt(agentid),
+      text: {
+        content: `${title}\n\n${content}\n\n🔗 点击确认前往：${confirmUrl}`
+      }
+    };
+  } else {
+    // 默认卡片消息
+    message = {
+      touser: touser || '@all',
+      msgtype: 'textcard',
+      agentid: parseInt(agentid),
+      textcard: {
+        title: title,
+        description: content.replace(/\\n/g, '\n'), // 将文字换行符转换为真实换行
+        url: confirmUrl,
+        btntxt: '前往确认'
+      }
+    };
+  }
+
+  const sendUrl = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`;
+  const sendResp = await fetch(sendUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(message)
+  });
+  const sendData = await sendResp.json();
+  if (sendData.errcode !== 0) {
+    // 如果 token 过期，尝试刷新一次
+    if (sendData.errcode === 42001 || sendData.errcode === 40014) {
+      await MOVE_CAR_STATUS.delete(tokenKey);
+      return sendWecomApp(corpid, agentid, secret, touser, title, content, confirmUrl, msgType); // 重试
+    }
+    throw new Error(`企业微信发送失败: ${sendData.errmsg}`);
+  }
+  return sendData;
+}
+
+// ========== 原有函数（修改 notify 部分） ==========
+
 async function handleNotify(request, url) {
   try {
     // 1. 检查 KV 是否绑定
@@ -100,24 +181,19 @@ async function handleNotify(request, url) {
     const message = body.message || '车旁有人等待';
     const location = body.location || null;
     const delayed = body.delayed || false;
-// --- 修改前 ---
-//  const confirmUrl = url.origin + '/owner-confirm';
 
-// --- 修改后：优先读取环境变量中的域名，如果没有配置则回退到原始域名 ---
     const baseDomain = (typeof EXTERNAL_URL !== 'undefined' && EXTERNAL_URL) 
                        ? EXTERNAL_URL.replace(/\/$/, "") // 去掉末尾斜杠
                        : url.origin;
 
     const confirmUrl = baseDomain + '/owner-confirm';
 
-    const confirmUrlEncoded = encodeURIComponent(confirmUrl);
-
     let notifyBody = '🚗 挪车请求';
-    if (message) notifyBody += `\\n💬 留言: ${message}`;
+    if (message) notifyBody += `\n💬 留言: ${message}`;
 
     if (location && location.lat && location.lng) {
       const urls = generateMapUrls(location.lat, location.lng);
-      notifyBody += '\\n📍 已附带位置信息，点击查看';
+      notifyBody += '\n📍 已附带位置信息，点击查看';
 
       await MOVE_CAR_STATUS.put('requester_location', JSON.stringify({
         lat: location.lat,
@@ -125,7 +201,7 @@ async function handleNotify(request, url) {
         ...urls
       }), { expirationTtl: CONFIG.KV_TTL });
     } else {
-      notifyBody += '\\n⚠️ 未提供位置信息';
+      notifyBody += '\n⚠️ 未提供位置信息';
     }
 
     await MOVE_CAR_STATUS.put('notify_status', 'waiting', { expirationTtl: 600 });
@@ -138,13 +214,13 @@ async function handleNotify(request, url) {
 
     // 检测 Bark 变量
     if (typeof BARK_URL !== 'undefined' && BARK_URL) {
-      const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${confirmUrlEncoded}`;
+      const barkApiUrl = `${BARK_URL}/挪车请求/${encodeURIComponent(notifyBody)}?group=MoveCar&level=critical&call=1&sound=minuet&icon=https://cdn-icons-png.flaticon.com/512/741/741407.png&url=${encodeURIComponent(confirmUrl)}`;
       notificationTasks.push(fetch(barkApiUrl));
     }
 
     // 检测 PushPlus 变量
     if (typeof PUSHPLUS_TOKEN !== 'undefined' && PUSHPLUS_TOKEN) {
-      const pushPlusContent = notifyBody.replace(/\\n/g, '<br>') + `<br><br><a href="${confirmUrl}">👉 点击此处处理挪车请求</a>`;
+      const pushPlusContent = notifyBody.replace(/\n/g, '<br>') + `<br><br><a href="${confirmUrl}">👉 点击此处处理挪车请求</a>`;
       notificationTasks.push(
         fetch('http://www.pushplus.plus/send', {
           method: 'POST',
@@ -160,9 +236,29 @@ async function handleNotify(request, url) {
       );
     }
 
-    // 如果两个都没配置，抛出错误
+    // ========== 新增 Webhook 通知 ==========
+    if (typeof WEBHOOK_URL !== 'undefined' && WEBHOOK_URL) {
+      notificationTasks.push(
+        sendWebhook(WEBHOOK_URL, '🚗 挪车请求', notifyBody, confirmUrl)
+      );
+    }
+
+    // ========== 新增企业微信应用消息 ==========
+    const wecomCorpid = typeof WECOM_CORPID !== 'undefined' ? WECOM_CORPID : null;
+    const wecomAgentid = typeof WECOM_AGENTID !== 'undefined' ? WECOM_AGENTID : null;
+    const wecomSecret = typeof WECOM_SECRET !== 'undefined' ? WECOM_SECRET : null;
+    const wecomTouser = typeof WECOM_TOUSER !== 'undefined' ? WECOM_TOUSER : '@all';
+    const wecomMsgType = typeof WECOM_MSGTYPE !== 'undefined' ? WECOM_MSGTYPE : 'card'; // 默认卡片
+
+    if (wecomCorpid && wecomAgentid && wecomSecret) {
+      notificationTasks.push(
+        sendWecomApp(wecomCorpid, wecomAgentid, wecomSecret, wecomTouser, '🚗 挪车请求', notifyBody, confirmUrl, wecomMsgType)
+      );
+    }
+
+    // 如果没有任何通知渠道配置，抛出错误
     if (notificationTasks.length === 0) {
-      throw new Error('未配置通知方式！请在后台设置 BARK_URL 或 PUSHPLUS_TOKEN 变量');
+      throw new Error('未配置任何通知方式！请在后台设置 BARK_URL、PUSHPLUS_TOKEN、WEBHOOK_URL 或企业微信相关变量');
     }
 
     await Promise.all(notificationTasks);
