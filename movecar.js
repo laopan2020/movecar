@@ -1,6 +1,7 @@
 /**
  * MoveCar 多用户智能挪车系统 - 并发隔离优化版
  * 隔离逻辑：每一个 KV 键值对都强制带上用户后缀，确保互不干扰
+ * 新增：Webhook 通知 + 企业微信应用消息
  */
 
 addEventListener('fetch', event => {
@@ -87,6 +88,71 @@ function generateMapUrls(lat, lng) {
   };
 }
 
+/** 发送通用 Webhook */
+async function sendWebhook(webhookUrl, title, content, confirmUrl) {
+  const payload = {
+    title: title,
+    content: content,
+    url: confirmUrl,
+    timestamp: Date.now()
+  };
+  return fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+/** 发送企业微信应用消息（文本卡片） */
+async function sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl) {
+  // 尝试从 KV 获取缓存的 access_token
+  const tokenKey = `wecom_token_${userKey}`;
+  let accessToken = await MOVE_CAR_STATUS.get(tokenKey);
+  
+  if (!accessToken) {
+    // 获取新 token
+    const tokenUrl = `https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid=${corpid}&corpsecret=${secret}`;
+    const tokenResp = await fetch(tokenUrl);
+    const tokenData = await tokenResp.json();
+    if (tokenData.errcode !== 0) {
+      throw new Error(`企业微信获取 token 失败: ${tokenData.errmsg}`);
+    }
+    accessToken = tokenData.access_token;
+    // 缓存 token，设置 7000 秒过期（官方 7200 秒）
+    await MOVE_CAR_STATUS.put(tokenKey, accessToken, { expirationTtl: 7000 });
+  }
+
+  // 构建文本卡片消息
+  const message = {
+    touser: touser || '@all',
+    msgtype: 'textcard',
+    agentid: parseInt(agentid),
+    textcard: {
+      title: title,
+      description: content.replace(/\\n/g, '\n'), // 将文字换行符转换为真实换行
+      url: confirmUrl,
+      btntxt: '前往确认'
+    }
+  };
+
+  const sendUrl = `https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token=${accessToken}`;
+  const sendResp = await fetch(sendUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(message)
+  });
+  const sendData = await sendResp.json();
+  if (sendData.errcode !== 0) {
+    // 如果 token 过期，尝试刷新一次
+    if (sendData.errcode === 42001 || sendData.errcode === 40014) {
+      await MOVE_CAR_STATUS.delete(tokenKey);
+      return sendWecomApp(userKey, corpid, agentid, secret, touser, title, content, confirmUrl); // 重试
+    }
+    throw new Error(`企业微信发送失败: ${sendData.errmsg}`);
+  }
+  return sendData;
+}
+
 /** 发送通知逻辑 **/
 async function handleNotify(request, url, userKey) {
   try {
@@ -105,17 +171,22 @@ async function handleNotify(request, url, userKey) {
     // 获取配置
     const ppToken = getUserConfig(userKey, 'PUSHPLUS_TOKEN');
     const barkUrl = getUserConfig(userKey, 'BARK_URL');
+    const webhookUrl = getUserConfig(userKey, 'WEBHOOK_URL');
+    const wecomCorpid = getUserConfig(userKey, 'WECOM_CORPID');
+    const wecomAgentid = getUserConfig(userKey, 'WECOM_AGENTID');
+    const wecomSecret = getUserConfig(userKey, 'WECOM_SECRET');
+    const wecomTouser = getUserConfig(userKey, 'WECOM_TOUSER') || '@all';
     const carTitle = getUserConfig(userKey, 'CAR_TITLE') || '车主';
 
     const baseDomain = (typeof EXTERNAL_URL !== 'undefined' && EXTERNAL_URL) ? EXTERNAL_URL.replace(/\/$/, "") : url.origin;
     const confirmUrl = baseDomain + "/owner-confirm?u=" + userKey;
 
-    let notifyText = "🚗 挪车请求【" + carTitle + "】\\n💬 留言: " + message;
+    let notifyText = "🚗 挪车请求【" + carTitle + "】\n💬 留言: " + message;
     
     // 隔离存储位置
     if (location && location.lat) {
       const maps = generateMapUrls(location.lat, location.lng);
-      notifyText += "\\n📍 已附带对方位置";
+      notifyText += "\n📍 已附带对方位置";
       await MOVE_CAR_STATUS.put("loc_" + userKey, JSON.stringify({ ...location, ...maps }), { expirationTtl: CONFIG.KV_TTL });
     }
 
@@ -129,16 +200,30 @@ async function handleNotify(request, url, userKey) {
     if (delayed) await new Promise(r => setTimeout(r, 30000));
 
     const tasks = [];
+
+    // PushPlus 通知
     if (ppToken) {
-      const htmlMsg = notifyText.replace(/\\n/g, '<br>') + '<br><br><a href="' + confirmUrl + '" style="font-weight:bold;color:#0093E9;font-size:18px;">【点击确认前往】</a>';
+      const htmlMsg = notifyText.replace(/\n/g, '<br>') + '<br><br><a href="' + confirmUrl + '" style="font-weight:bold;color:#0093E9;font-size:18px;">【点击确认前往】</a>';
       tasks.push(fetch('http://www.pushplus.plus/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ token: ppToken, title: "🚗 挪车请求：" + carTitle, content: htmlMsg, template: 'html' })
       }));
     }
+
+    // Bark 通知
     if (barkUrl) {
       tasks.push(fetch(barkUrl + "/" + encodeURIComponent('挪车请求') + "/" + encodeURIComponent(notifyText) + "?url=" + encodeURIComponent(confirmUrl)));
+    }
+
+    // 通用 Webhook 通知
+    if (webhookUrl) {
+      tasks.push(sendWebhook(webhookUrl, "挪车请求：" + carTitle, notifyText, confirmUrl));
+    }
+
+    // 企业微信应用消息
+    if (wecomCorpid && wecomAgentid && wecomSecret) {
+      tasks.push(sendWecomApp(userKey, wecomCorpid, wecomAgentid, wecomSecret, wecomTouser, "挪车请求：" + carTitle, notifyText, confirmUrl));
     }
 
     await Promise.all(tasks);
