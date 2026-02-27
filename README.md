@@ -40,8 +40,7 @@
 ### 企业微信应用消息 (微信推荐)
 - 需企业微信创建应用，微信绑定后可以直接在微信查看。
 - 支持 HTML 格式，点击通知即可直接跳转到确认处理页面。
-- 使用 文本卡片 类型，点击“前往确认”可直接跳转车主确认页。
-- Access Token 自动缓存至 KV（键名 wecom_token_<userKey>），有效期 7000 秒，避免频繁获取。
+- 使用 卡片(默认)/文本(可选) 类型，点击“前往确认”可直接跳转车主确认页。
 
 ### Webhook (通用)
 - 发送 POST JSON 数据，格式为 { title, content, url, timestamp }，接收方可自行解析处理。
@@ -85,6 +84,12 @@
 #### 1. 默认全局变量 (可选)
 - `BARK_URL`：默认推送地址。
 - `PUSHPLUS_TOKEN`：默认微信令牌。
+- `WEBHOOK_URL`：通用 Webhook 地址。
+- `WECOM_CORPID`：企业微信企业 ID。
+- `WECOM_AGENTID`：应用 AgentId。
+- `WECOM_SECRET`：应用 Secret。
+- `WECOM_TOUSER`：接收消息的用户 ID，多个用 | 分隔，默认为 @all。
+- `WECOM_MSGTYPE`：企业微信消息类型：card（卡片，含按钮）或 text（纯文本，含链接）。
 
 #### 2. 用户专属变量 (强烈推荐)
 **格式：`变量名_用户ID` (ID需大写)**。例如你的 ID 是 `xiaowang`：
@@ -92,6 +97,12 @@
 - `CAR_TITLE_XIAOWANG`：显示的车辆/车主信息（如：粤B·88888）。
 - `EXTERNAL_URL`：填入你的反代备案域名（例如 https://xx.xxx.com）-（可选，注意：带上https，末尾不要带斜杠)
 - `PHONE_NUMBER_XIAOWANG`：该车主的备用电话-通知车主后没有回应的时候可以直接拨打电话（可选）。
+- `WEBHOOK_URL_XIAOWANG`：通用 Webhook 地址。
+- `WECOM_CORPID_XIAOWANG`：企业微信企业 ID。
+- `WECOM_AGENTID_XIAOWANG`：应用 AgentId。
+- `WECOM_SECRET_XIAOWANG`：应用 Secret。
+- `WECOM_TOUSER_XIAOWANG`：接收消息的用户 ID，多个用 | 分隔，默认为 @all。
+- `WECOM_MSGTYPE_XIAOWANG`：企业微信消息类型：card（卡片，含按钮）或 text（纯文本，含链接）。
 
 ### 第五步：绑定域名 (可选)
 在「Settings」 -> 「Domains & Routes」中绑定你的自定义域名。
